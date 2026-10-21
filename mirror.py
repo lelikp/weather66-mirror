@@ -1,0 +1,257 @@
+"""Зеркала публикаций: ВКонтакте (группа). Макс добавим, когда появится канал.
+
+Нужны переменные окружения (GitHub Secrets):
+  VK_TOKEN     — ключ доступа сообщества (права: стена, фотографии, управление)
+  VK_GROUP_ID  — числовой id сообщества (допустимо и короткое имя, например weather66)
+"""
+import io
+import os
+import re
+import time
+import requests
+
+VK_API = "https://api.vk.com/method/"
+VK_VERSION = "5.199"
+
+
+class VKError(Exception):
+    def __init__(self, code, msg):
+        super().__init__(f"VK error {code}: {msg}")
+        self.code = code
+
+
+def html_to_plain(text: str) -> str:
+    """ВК не понимает HTML: убираем теги, возвращаем сущности."""
+    t = re.sub(r"<br\s*/?>", "\n", text)
+    t = re.sub(r"<[^>]+>", "", t)
+    return t.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+def _call(method, token, params=None, files=None, retries=3, logger=None):
+    data = dict(params or {})
+    data.update({"access_token": token, "v": VK_VERSION})
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(VK_API + method, data=data, files=files, timeout=60)
+            j = r.json()
+            if "error" in j:
+                err = j["error"]
+                code = err.get("error_code")
+                if code == 6 and attempt < retries:      # слишком часто
+                    time.sleep(1.5 * attempt)
+                    continue
+                raise VKError(code, err.get("error_msg"))
+            return j["response"]
+        except VKError:
+            raise
+        except Exception as e:                            # сеть, не-JSON
+            last = e
+            if logger:
+                logger.warning(f"VK {method}: попытка {attempt}/{retries}: {e}")
+            if attempt < retries:
+                time.sleep(3 * attempt)
+    raise RuntimeError(f"VK {method}: {last}")
+
+
+def resolve_group_id(token, group, logger=None):
+    group = str(group).strip().lstrip("-")
+    if group.isdigit():
+        return int(group)
+    res = _call("utils.resolveScreenName", token, {"screen_name": group}, logger=logger)
+    if not res or res.get("type") not in ("group", "page", "event"):
+        raise RuntimeError(f"Не удалось определить id сообщества по имени «{group}»")
+    return int(res["object_id"])
+
+
+def _upload_wall_photo(token, gid, img, logger=None):
+    srv = _call("photos.getWallUploadServer", token, {"group_id": gid}, logger=logger)
+    if isinstance(img, (bytes, bytearray)):          # готовые байты (JPEG из Telegram)
+        buf, name, mime = io.BytesIO(img), "photo.jpg", "image/jpeg"
+    else:                                            # PIL-картинка
+        buf, name, mime = io.BytesIO(), "forecast.png", "image/png"
+        img.save(buf, format="PNG")
+        buf.seek(0)
+    up = requests.post(srv["upload_url"], files={"photo": (name, buf, mime)}, timeout=90).json()
+    if not up.get("photo") or up.get("photo") == "[]":
+        raise RuntimeError(f"ВК не принял картинку: {up}")
+    saved = _call("photos.saveWallPhoto", token,
+                  {"group_id": gid, "photo": up["photo"], "server": up["server"], "hash": up["hash"]},
+                  logger=logger)
+    p = saved[0]
+    return f"photo{p['owner_id']}_{p['id']}"
+
+
+def mirror_to_vk(images, caption_html, logger):
+    """Публикует картинки и подпись на стене группы.
+    Возвращает True (опубликовано), False (ошибка), None (ВК не настроен)."""
+    token, group = os.getenv("VK_TOKEN"), os.getenv("VK_GROUP_ID")
+    if not token or not group:
+        logger.info("VK_TOKEN/VK_GROUP_ID не заданы — зеркало ВК пропущено")
+        return None
+    try:
+        gid = resolve_group_id(token, group, logger)
+        atts = [_upload_wall_photo(token, gid, im, logger) for im in images[:10]]
+        res = _call("wall.post", token, {
+            "owner_id": -gid, "from_group": 1,
+            "message": html_to_plain(caption_html),
+            "attachments": ",".join(atts),
+        }, logger=logger)
+        logger.info(f"✅ Пост опубликован в ВК (post_id={res.get('post_id')})")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Зеркало ВК не удалось: {e}")
+        return False
+
+
+def post_to_vk(images, text, logger):
+    """Пост на стену группы: text — уже простой текст, images — список PIL-картинок или bytes.
+    Бросает исключение при ошибке."""
+    token, group = os.getenv("VK_TOKEN"), os.getenv("VK_GROUP_ID")
+    if not token or not group:
+        raise RuntimeError("VK_TOKEN/VK_GROUP_ID не заданы")
+    gid = resolve_group_id(token, group, logger)
+    atts = [_upload_wall_photo(token, gid, im, logger) for im in images[:10]]
+    params = {"owner_id": -gid, "from_group": 1, "message": text}
+    if atts:
+        params["attachments"] = ",".join(atts)
+    res = _call("wall.post", token, params, logger=logger)
+    return res.get("post_id")
+
+
+def check_vk(logger):
+    """Проверка токена и прав без публикации. Возвращает True/False."""
+    token, group = os.getenv("VK_TOKEN"), os.getenv("VK_GROUP_ID")
+    if not token or not group:
+        logger.error("VK_TOKEN или VK_GROUP_ID не заданы в Secrets")
+        return False
+    try:
+        gid = resolve_group_id(token, group, logger)
+        info = _call("groups.getById", token, {"group_id": gid}, logger=logger)
+        g = info["groups"][0] if isinstance(info, dict) else info[0]
+        logger.info(f"Сообщество: «{g.get('name')}» (id {gid})")
+        _call("photos.getWallUploadServer", token, {"group_id": gid}, logger=logger)
+        logger.info("✅ Права на загрузку фото есть")
+        _call("wall.get", token, {"owner_id": -gid, "count": 1}, logger=logger)
+        logger.info("✅ Стена читается. Публиковать можно (проверка поста не делалась)")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Проверка ВК не пройдена: {e}")
+        return False
+
+
+# ===================== MAX (platform-api2.max.ru) =====================
+MAX_API = "https://platform-api2.max.ru"
+MAX_TEXT_LIMIT = 4000
+
+
+def _max_verify():
+    """Корневой сертификат Минцифры: если TLS не проходит, положите PEM и укажите путь в MAX_CA_FILE."""
+    return os.getenv("MAX_CA_FILE") or True
+
+
+def split_text(text, limit=MAX_TEXT_LIMIT):
+    """Режем длинный текст по абзацам/строкам, чтобы каждая часть влезла в лимит."""
+    parts, cur = [], ""
+    for para in text.split("\n"):
+        while len(para) > limit:                      # одна строка длиннее лимита
+            if cur:
+                parts.append(cur); cur = ""
+            parts.append(para[:limit]); para = para[limit:]
+        add = para if not cur else cur + "\n" + para
+        if len(add) > limit:
+            parts.append(cur); cur = para
+        else:
+            cur = add
+    if cur or not parts:
+        parts.append(cur)
+    return parts
+
+
+def _max_req(method, path, token, logger=None, retries=3, **kw):
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.request(method, MAX_API + path, headers={"Authorization": token},
+                                 timeout=60, verify=_max_verify(), **kw)
+            if r.status_code == 429 and attempt < retries:
+                time.sleep(2 * attempt); continue
+            if r.status_code >= 500 and attempt < retries:
+                time.sleep(3 * attempt); continue
+            return r
+        except requests.exceptions.SSLError:
+            raise RuntimeError("TLS-ошибка при обращении к Макс: нужен корневой сертификат Минцифры (MAX_CA_FILE)")
+        except Exception as e:
+            last = e
+            if logger:
+                logger.warning(f"MAX {path}: попытка {attempt}/{retries}: {e}")
+            if attempt < retries:
+                time.sleep(3 * attempt)
+    raise RuntimeError(f"MAX {path}: {last}")
+
+
+def _max_upload_image(token, data, logger=None):
+    r = _max_req("POST", "/uploads?type=image", token, logger)
+    if r.status_code != 200:
+        raise RuntimeError(f"MAX /uploads: {r.status_code} {r.text[:200]}")
+    url = r.json()["url"]
+    if isinstance(data, (bytes, bytearray)):
+        blob, name, mime = bytes(data), "photo.jpg", "image/jpeg"
+    else:
+        b = io.BytesIO(); data.save(b, format="PNG"); blob, name, mime = b.getvalue(), "forecast.png", "image/png"
+    up = requests.post(url, headers={"Authorization": token}, files={"data": (name, blob, mime)},
+                       timeout=90, verify=_max_verify())
+    if up.status_code != 200:
+        raise RuntimeError(f"MAX upload: {up.status_code} {up.text[:200]}")
+    photos = up.json().get("photos") or {}
+    for v in photos.values():
+        if v.get("token"):
+            return v["token"]
+    raise RuntimeError(f"MAX: в ответе загрузки нет token: {str(up.text)[:200]}")
+
+
+def _max_send(token, chat_id, text, tokens, logger=None):
+    body = {"text": text}
+    if tokens:
+        body["attachments"] = [{"type": "image", "payload": {"token": t}} for t in tokens]
+    for attempt in range(6):                          # attachment.not.ready: ждём и повторяем
+        r = _max_req("POST", f"/messages?chat_id={chat_id}", token, logger, json=body)
+        if r.status_code == 200:
+            return r.json()
+        if "attachment.not.ready" in r.text and attempt < 5:
+            time.sleep(1.5 * (2 ** attempt)); continue
+        raise RuntimeError(f"MAX /messages: {r.status_code} {r.text[:300]}")
+
+
+def post_to_max(images, text, logger):
+    """Пост в канал Макс: картинки (до 12) + текст, длинный текст — продолжением отдельными сообщениями."""
+    token, chat = os.getenv("MAX_TOKEN"), os.getenv("MAX_CHAT_ID")
+    if not token or not chat:
+        raise RuntimeError("MAX_TOKEN/MAX_CHAT_ID не заданы")
+    tokens = [_max_upload_image(token, im, logger) for im in images[:12]]
+    parts = split_text(text)
+    first = _max_send(token, chat, parts[0], tokens, logger)
+    for extra in parts[1:]:
+        time.sleep(0.6)                               # не чаще 2 сообщений в секунду
+        _max_send(token, chat, extra, [], logger)
+    return (first.get("message") or first).get("body", {}).get("mid")
+
+
+def check_max(logger):
+    token, chat = os.getenv("MAX_TOKEN"), os.getenv("MAX_CHAT_ID")
+    if not token or not chat:
+        logger.info("MAX_TOKEN/MAX_CHAT_ID не заданы — Макс пропущен")
+        return None
+    try:
+        r = _max_req("GET", "/me", token, logger)
+        if r.status_code != 200:
+            raise RuntimeError(f"/me: {r.status_code} {r.text[:200]}")
+        logger.info(f"Макс: бот «{r.json().get('name') or r.json().get('first_name')}» доступен")
+        r = _max_req("GET", f"/chats/{chat}", token, logger)
+        if r.status_code != 200:
+            raise RuntimeError(f"/chats/{chat}: {r.status_code} {r.text[:200]}")
+        logger.info(f"✅ Канал Макс найден: «{r.json().get('title')}»")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Проверка Макс не пройдена: {e}")
+        return False
