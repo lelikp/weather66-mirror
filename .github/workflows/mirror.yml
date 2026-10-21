@@ -33,6 +33,7 @@ jobs:
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           VK_TOKEN: ${{ secrets.VK_TOKEN }}
           VK_GROUP_ID: ${{ secrets.VK_GROUP_ID }}
+          VK_USER_TOKEN: ${{ secrets.VK_USER_TOKEN }}
           MAX_TOKEN: ${{ secrets.MAX_TOKEN }}
           MAX_CHAT_ID: ${{ secrets.MAX_CHAT_ID }}
           CHECK: ${{ inputs.check && '1' || '0' }}
