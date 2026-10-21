@@ -64,14 +64,30 @@ def resolve_group_id(token, group, logger=None):
     return int(res["object_id"])
 
 
+def _as_file(img):
+    if isinstance(img, (bytes, bytearray)):          # готовые байты (JPEG из Telegram)
+        return io.BytesIO(img), "photo.jpg", "image/jpeg"
+    buf = io.BytesIO()                               # PIL-картинка
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf, "forecast.png", "image/png"
+
+
+def _upload_wall_doc(token, gid, img, logger=None):
+    """Картинка как документ: запасной путь, если фото на стену ключом сообщества не загрузить."""
+    srv = _call("docs.getWallUploadServer", token, {"group_id": gid}, logger=logger)
+    buf, name, mime = _as_file(img)
+    up = requests.post(srv["upload_url"], files={"file": (name, buf, mime)}, timeout=90).json()
+    if not up.get("file"):
+        raise RuntimeError(f"ВК не принял документ: {up}")
+    saved = _call("docs.save", token, {"file": up["file"], "title": name}, logger=logger)
+    d = saved["doc"] if isinstance(saved, dict) and "doc" in saved else saved[0]
+    return f"doc{d['owner_id']}_{d['id']}"
+
+
 def _upload_wall_photo(token, gid, img, logger=None):
     srv = _call("photos.getWallUploadServer", token, {"group_id": gid}, logger=logger)
-    if isinstance(img, (bytes, bytearray)):          # готовые байты (JPEG из Telegram)
-        buf, name, mime = io.BytesIO(img), "photo.jpg", "image/jpeg"
-    else:                                            # PIL-картинка
-        buf, name, mime = io.BytesIO(), "forecast.png", "image/png"
-        img.save(buf, format="PNG")
-        buf.seek(0)
+    buf, name, mime = _as_file(img)
     up = requests.post(srv["upload_url"], files={"photo": (name, buf, mime)}, timeout=90).json()
     if not up.get("photo") or up.get("photo") == "[]":
         raise RuntimeError(f"ВК не принял картинку: {up}")
@@ -104,23 +120,51 @@ def mirror_to_vk(images, caption_html, logger):
         return False
 
 
-def post_to_vk(images, text, logger):
-    """Пост на стену группы: text — уже простой текст, images — список PIL-картинок или bytes.
-    Бросает исключение при ошибке."""
+_BAD_ROUTES = set()      # пути загрузки, которые в этом запуске уже отказали (код 27 и т.п.)
+_PERMANENT = (3, 5, 7, 15, 27, 100)
+
+
+def post_to_vk(images, text, logger, link=None):
+    """Пост на стену группы: text — простой текст, images — PIL-картинки или bytes, link — адрес поста в Telegram.
+    Картинки грузятся по цепочке: фото токеном пользователя (если задан VK_USER_TOKEN) -> фото ключом сообщества ->
+    документы -> без картинок (тогда к посту прикладывается ссылка на оригинал). Бросает исключение при ошибке."""
     token, group = os.getenv("VK_TOKEN"), os.getenv("VK_GROUP_ID")
+    utoken = os.getenv("VK_USER_TOKEN")
     if not token or not group:
         raise RuntimeError("VK_TOKEN/VK_GROUP_ID не заданы")
     gid = resolve_group_id(token, group, logger)
-    atts = [_upload_wall_photo(token, gid, im, logger) for im in images[:10]]
+    atts = []
+    if images:
+        routes = []
+        if utoken:
+            routes.append(("фото (токен пользователя)", lambda im: _upload_wall_photo(utoken, gid, im, logger)))
+        routes += [("фото", lambda im: _upload_wall_photo(token, gid, im, logger)),
+                   ("документы", lambda im: _upload_wall_doc(token, gid, im, logger))]
+        for name, up in routes:
+            if name in _BAD_ROUTES:
+                continue
+            try:
+                atts = [up(im) for im in images[:10]]
+                break
+            except VKError as e:
+                if e.code not in _PERMANENT:
+                    raise
+                _BAD_ROUTES.add(name)
+                logger.warning(f"ВК: путь «{name}» недоступен ({e}); пробую следующий")
+        if not atts:
+            logger.warning("ВК: картинки перенести не удалось, в пост добавлена ссылка на оригинал")
     params = {"owner_id": -gid, "from_group": 1, "message": text}
     if atts:
         params["attachments"] = ",".join(atts)
+    elif images and link:
+        params["attachments"] = link
     res = _call("wall.post", token, params, logger=logger)
     return res.get("post_id")
 
 
 def check_vk(logger):
-    """Проверка токена и прав без публикации. Возвращает True/False."""
+    """Проверка токена и способов загрузки картинок без публикации.
+    Возвращает False только если сообщество недоступно; отсутствие загрузки картинок — предупреждение."""
     token, group = os.getenv("VK_TOKEN"), os.getenv("VK_GROUP_ID")
     if not token or not group:
         logger.error("VK_TOKEN или VK_GROUP_ID не заданы в Secrets")
@@ -130,14 +174,31 @@ def check_vk(logger):
         info = _call("groups.getById", token, {"group_id": gid}, logger=logger)
         g = info["groups"][0] if isinstance(info, dict) else info[0]
         logger.info(f"Сообщество: «{g.get('name')}» (id {gid})")
-        _call("photos.getWallUploadServer", token, {"group_id": gid}, logger=logger)
-        logger.info("✅ Права на загрузку фото есть")
-        _call("wall.get", token, {"owner_id": -gid, "count": 1}, logger=logger)
-        logger.info("✅ Стена читается. Публиковать можно (проверка поста не делалась)")
-        return True
     except Exception as e:
         logger.error(f"❌ Проверка ВК не пройдена: {e}")
         return False
+    probes = [("фото на стену ключом сообщества", token, "photos.getWallUploadServer", {"group_id": gid}),
+              ("документы ключом сообщества (картинка как документ)", token, "docs.getWallUploadServer", {"group_id": gid})]
+    if os.getenv("VK_USER_TOKEN"):
+        probes.insert(0, ("фото на стену токеном пользователя", os.getenv("VK_USER_TOKEN"),
+                          "photos.getWallUploadServer", {"group_id": gid}))
+    ok_any = False
+    for label, tk, method, prm in probes:
+        try:
+            _call(method, tk, prm, retries=1, logger=logger)
+            logger.info(f"✅ Доступно: {label}")
+            ok_any = True
+        except Exception as e:
+            logger.warning(f"⚠ Недоступно: {label}: {e}")
+    try:
+        _call("wall.get", token, {"owner_id": -gid, "count": 1}, retries=1, logger=logger)
+        logger.info("✅ Стена читается")
+    except Exception as e:
+        logger.warning(f"⚠ wall.get: {e} (публикация текста может всё равно работать)")
+    if not ok_any:
+        logger.warning("⚠ Картинки в ВК перенести нельзя: посты с фото уйдут текстом со ссылкой на Telegram")
+    logger.info("Публикация текста проверится только реальным постом (проверка ничего не публикует)")
+    return True
 
 
 # ===================== MAX (platform-api2.max.ru) =====================
@@ -223,7 +284,7 @@ def _max_send(token, chat_id, text, tokens, logger=None):
         raise RuntimeError(f"MAX /messages: {r.status_code} {r.text[:300]}")
 
 
-def post_to_max(images, text, logger):
+def post_to_max(images, text, logger, link=None):
     """Пост в канал Макс: картинки (до 12) + текст, длинный текст — продолжением отдельными сообщениями."""
     token, chat = os.getenv("MAX_TOKEN"), os.getenv("MAX_CHAT_ID")
     if not token or not chat:

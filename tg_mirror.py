@@ -108,7 +108,7 @@ def mirror_unit(msgs):
     done, failed = [], []
     for name, fn in targets():
         try:
-            fn(images, text, log)
+            fn(images, text, log, link=post_url(msgs[0]))
             done.append(name)
         except Exception as e:
             log.error(f"❌ пост {msgs[0]['message_id']} → {name}: {e}")
