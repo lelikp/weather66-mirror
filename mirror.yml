@@ -1,0 +1,40 @@
+name: tg-mirror
+
+on:
+  workflow_dispatch:      # запускается внешним cron (cron-job.org) каждые 15–30 минут
+    inputs:
+      check:
+        description: "Только проверить настройки (ничего не публикуется)"
+        type: boolean
+        default: false
+      skip_backlog:
+        description: "Первый запуск: отметить накопившиеся посты прочитанными, ничего не пересылая"
+        type: boolean
+        default: false
+
+concurrency:
+  group: tg-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install requests
+      - name: Mirror new Telegram posts
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          VK_TOKEN: ${{ secrets.VK_TOKEN }}
+          VK_GROUP_ID: ${{ secrets.VK_GROUP_ID }}
+          MAX_TOKEN: ${{ secrets.MAX_TOKEN }}
+          MAX_CHAT_ID: ${{ secrets.MAX_CHAT_ID }}
+          CHECK: ${{ inputs.check && '1' || '0' }}
+          SKIP_BACKLOG: ${{ inputs.skip_backlog && '1' || '0' }}
+        run: python tg_mirror.py
