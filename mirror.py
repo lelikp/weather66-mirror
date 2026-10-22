@@ -127,7 +127,7 @@ _PERMANENT = (3, 5, 7, 15, 27, 100)
 def post_to_vk(images, text, logger, link=None):
     """Пост на стену группы: text — простой текст, images — PIL-картинки или bytes, link — адрес поста в Telegram.
     Картинки грузятся по цепочке: фото токеном пользователя (если задан VK_USER_TOKEN) -> фото ключом сообщества ->
-    документы -> без картинок (тогда к посту прикладывается ссылка на оригинал). Бросает исключение при ошибке."""
+    документы -> без картинок (тогда в текст дописывается ссылка на оригинал). Бросает исключение при ошибке."""
     token, group = os.getenv("VK_TOKEN"), os.getenv("VK_GROUP_ID")
     utoken = os.getenv("VK_USER_TOKEN")
     if not token or not group:
@@ -153,11 +153,12 @@ def post_to_vk(images, text, logger, link=None):
                 logger.warning(f"ВК: путь «{name}» недоступен ({e}); пробую следующий")
         if not atts:
             logger.warning("ВК: картинки перенести не удалось, в пост добавлена ссылка на оригинал")
+    if images and not atts and link:
+        # ссылка-вложение через API без картинки не принимается (link_photo_sizing_rule): дописываем в текст
+        text = (text + "\n\n" if text else "") + f"📷 Фото: {link}"
     params = {"owner_id": -gid, "from_group": 1, "message": text}
     if atts:
         params["attachments"] = ",".join(atts)
-    elif images and link:
-        params["attachments"] = link
     res = _call("wall.post", token, params, logger=logger)
     return res.get("post_id")
 
