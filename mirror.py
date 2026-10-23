@@ -73,6 +73,32 @@ def _as_file(img):
     return buf, "forecast.png", "image/png"
 
 
+def _to_pil(img):
+    from PIL import Image
+    return img if hasattr(img, "size") and hasattr(img, "convert") else Image.open(io.BytesIO(img))
+
+
+def make_collage(images, gap=12, col_width=1000):
+    """Склеивает несколько картинок в одну (две колонки, как в альбоме Telegram): в пост ВК с ключом сообщества
+    помещается только один документ. Порядок: каждая следующая картинка ложится в более короткую колонку."""
+    from PIL import Image
+    pics = [_to_pil(im).convert("RGB") for im in images]
+    w = min(col_width, max(p.width for p in pics))
+    pics = [p.resize((w, max(1, round(p.height * w / p.width)))) if p.width != w else p for p in pics]
+    cols = [[], []]
+    heights = [0, 0]
+    for p in pics:
+        c = 0 if heights[0] <= heights[1] else 1
+        cols[c].append((p, heights[c]))
+        heights[c] += p.height + gap
+    ncols = 2 if cols[1] else 1
+    out = Image.new("RGB", (w * ncols + gap * (ncols - 1), max(heights) - gap), "white")
+    for c in range(ncols):
+        for p, y in cols[c]:
+            out.paste(p, (c * (w + gap), y))
+    return out
+
+
 def _upload_wall_doc(token, gid, img, logger=None):
     """Картинка как документ: запасной путь, если фото на стену ключом сообщества не загрузить."""
     srv = _call("docs.getWallUploadServer", token, {"group_id": gid}, logger=logger)
@@ -136,6 +162,7 @@ def post_to_vk(images, text, logger, link=None):
         raise RuntimeError("VK_TOKEN/VK_GROUP_ID не заданы")
     gid = resolve_group_id(token, group, logger)
     atts, kind = [], None
+    n_images = len(images)                      # сколько картинок считаем «перенесёнными целиком»
     if images:
         routes = []
         if utoken:
@@ -147,8 +174,14 @@ def post_to_vk(images, text, logger, link=None):
                 continue
             try:
                 imgs = images[:10]
-                if k == "doc" and _DOC_LIMIT[0]:
-                    imgs = imgs[:_DOC_LIMIT[0]]          # уже знаем лимит: лишнее не загружаем
+                if k == "doc" and len(imgs) > 1:
+                    # ключ сообщества: в посте один документ -> весь альбом одной картинкой
+                    try:
+                        imgs = [make_collage(imgs)]
+                    except Exception as e:                       # не удалось склеить: хотя бы первая картинка
+                        logger.warning(f"Склейка альбома не удалась ({e}); берём первую картинку")
+                        imgs = imgs[:1]
+                    n_images = 1
                 atts, kind = [up(im) for im in imgs], k
                 break
             except VKError as e:
@@ -161,7 +194,7 @@ def post_to_vk(images, text, logger, link=None):
 
     def publish(att_list):
         msg = text
-        if images and len(att_list) < len(images) and link:
+        if images and len(att_list) < n_images and link:
             # часть картинок не перенесена (или ни одной): ссылка на оригинал в текст, вложением её нельзя
             msg = (text + "\n\n" if text else "") + f"📷 Все фото: {link}"
         params = {"owner_id": -gid, "from_group": 1, "message": msg}
