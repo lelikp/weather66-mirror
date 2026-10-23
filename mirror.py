@@ -121,30 +121,35 @@ def mirror_to_vk(images, caption_html, logger):
 
 
 _BAD_ROUTES = set()      # пути загрузки, которые в этом запуске уже отказали (код 27 и т.п.)
-_PERMANENT = (3, 5, 7, 15, 27, 100)
+_PERMANENT = (3, 5, 7, 15, 27)
+_DOC_LIMIT = [None]      # сколько документов ВК принимает в одном посте (определяется на первой ошибке)
 
 
 def post_to_vk(images, text, logger, link=None):
     """Пост на стену группы: text — простой текст, images — PIL-картинки или bytes, link — адрес поста в Telegram.
     Картинки грузятся по цепочке: фото токеном пользователя (если задан VK_USER_TOKEN) -> фото ключом сообщества ->
-    документы -> без картинок (тогда в текст дописывается ссылка на оригинал). Бросает исключение при ошибке."""
+    документы -> без картинок (тогда в текст дописывается ссылка на оригинал). Если ВК принимает меньше документов,
+    чем картинок, лишние отбрасываются, а в текст дописывается ссылка на оригинал. Бросает исключение при ошибке."""
     token, group = os.getenv("VK_TOKEN"), os.getenv("VK_GROUP_ID")
     utoken = os.getenv("VK_USER_TOKEN")
     if not token or not group:
         raise RuntimeError("VK_TOKEN/VK_GROUP_ID не заданы")
     gid = resolve_group_id(token, group, logger)
-    atts = []
+    atts, kind = [], None
     if images:
         routes = []
         if utoken:
-            routes.append(("фото (токен пользователя)", lambda im: _upload_wall_photo(utoken, gid, im, logger)))
-        routes += [("фото", lambda im: _upload_wall_photo(token, gid, im, logger)),
-                   ("документы", lambda im: _upload_wall_doc(token, gid, im, logger))]
-        for name, up in routes:
+            routes.append(("фото (токен пользователя)", "photo", lambda im: _upload_wall_photo(utoken, gid, im, logger)))
+        routes += [("фото", "photo", lambda im: _upload_wall_photo(token, gid, im, logger)),
+                   ("документы", "doc", lambda im: _upload_wall_doc(token, gid, im, logger))]
+        for name, k, up in routes:
             if name in _BAD_ROUTES:
                 continue
             try:
-                atts = [up(im) for im in images[:10]]
+                imgs = images[:10]
+                if k == "doc" and _DOC_LIMIT[0]:
+                    imgs = imgs[:_DOC_LIMIT[0]]          # уже знаем лимит: лишнее не загружаем
+                atts, kind = [up(im) for im in imgs], k
                 break
             except VKError as e:
                 if e.code not in _PERMANENT:
@@ -153,13 +158,30 @@ def post_to_vk(images, text, logger, link=None):
                 logger.warning(f"ВК: путь «{name}» недоступен ({e}); пробую следующий")
         if not atts:
             logger.warning("ВК: картинки перенести не удалось, в пост добавлена ссылка на оригинал")
-    if images and not atts and link:
-        # ссылка-вложение через API без картинки не принимается (link_photo_sizing_rule): дописываем в текст
-        text = (text + "\n\n" if text else "") + f"📷 Фото: {link}"
-    params = {"owner_id": -gid, "from_group": 1, "message": text}
-    if atts:
-        params["attachments"] = ",".join(atts)
-    res = _call("wall.post", token, params, logger=logger)
+
+    def publish(att_list):
+        msg = text
+        if images and len(att_list) < len(images) and link:
+            # часть картинок не перенесена (или ни одной): ссылка на оригинал в текст, вложением её нельзя
+            msg = (text + "\n\n" if text else "") + f"📷 Все фото: {link}"
+        params = {"owner_id": -gid, "from_group": 1, "message": msg}
+        if att_list:
+            params["attachments"] = ",".join(att_list)
+        return _call("wall.post", token, params, logger=logger)
+
+    k = len(atts)
+    while True:
+        try:
+            res = publish(atts[:k])
+            break
+        except VKError as e:
+            if kind == "doc" and e.code == 100 and "doc attachments" in str(e) and k > 0:
+                k -= 1                                   # ВК принимает меньше документов в одном посте (до нуля)
+                continue
+            raise
+    if kind == "doc" and k < len(atts):
+        _DOC_LIMIT[0] = k
+        logger.warning(f"ВК принимает не более {k} документов в посте: остальные картинки не вложены")
     return res.get("post_id")
 
 
