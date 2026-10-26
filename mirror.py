@@ -99,11 +99,34 @@ def make_collage(images, gap=12, col_width=1000):
     return out
 
 
+def _post_upload(url, field, img, logger=None, retries=3):
+    """Загрузка файла на сервер ВК. Сервер иногда отвечает не JSON (пусто, HTML, 5xx) — повторяем и пишем в лог,
+    что именно пришло, чтобы было видно причину."""
+    last = None
+    for attempt in range(1, retries + 1):
+        buf, name, mime = _as_file(img)
+        try:
+            r = requests.post(url, files={field: (name, buf, mime)}, timeout=90)
+            try:
+                return r.json()
+            except ValueError:
+                snippet = (r.text or "")[:200].replace("\n", " ")
+                last = RuntimeError(f"сервер загрузки ВК ответил не JSON: HTTP {r.status_code}, "
+                                    f"{r.headers.get('Content-Type', '?')}, {len(r.content)} байт, «{snippet}»")
+        except requests.RequestException as e:
+            last = e
+        if logger:
+            logger.warning(f"ВК загрузка файла: попытка {attempt}/{retries}: {last}")
+        if attempt < retries:
+            time.sleep(3 * attempt)
+    raise RuntimeError(str(last))
+
+
 def _upload_wall_doc(token, gid, img, logger=None):
     """Картинка как документ: запасной путь, если фото на стену ключом сообщества не загрузить."""
     srv = _call("docs.getWallUploadServer", token, {"group_id": gid}, logger=logger)
-    buf, name, mime = _as_file(img)
-    up = requests.post(srv["upload_url"], files={"file": (name, buf, mime)}, timeout=90).json()
+    _, name, _ = _as_file(img)
+    up = _post_upload(srv["upload_url"], "file", img, logger)
     if not up.get("file"):
         raise RuntimeError(f"ВК не принял документ: {up}")
     saved = _call("docs.save", token, {"file": up["file"], "title": name}, logger=logger)
@@ -113,8 +136,7 @@ def _upload_wall_doc(token, gid, img, logger=None):
 
 def _upload_wall_photo(token, gid, img, logger=None):
     srv = _call("photos.getWallUploadServer", token, {"group_id": gid}, logger=logger)
-    buf, name, mime = _as_file(img)
-    up = requests.post(srv["upload_url"], files={"photo": (name, buf, mime)}, timeout=90).json()
+    up = _post_upload(srv["upload_url"], "photo", img, logger)
     if not up.get("photo") or up.get("photo") == "[]":
         raise RuntimeError(f"ВК не принял картинку: {up}")
     saved = _call("photos.saveWallPhoto", token,
@@ -189,6 +211,8 @@ def post_to_vk(images, text, logger, link=None):
                     raise
                 _BAD_ROUTES.add(name)
                 logger.warning(f"ВК: путь «{name}» недоступен ({e}); пробую следующий")
+            except Exception as e:                       # сбой загрузки файла (не ответ API): пост всё равно выходит
+                logger.warning(f"ВК: путь «{name}» не сработал ({e}); пробую следующий")
         if not atts:
             logger.warning("ВК: картинки перенести не удалось, в пост добавлена ссылка на оригинал")
 
