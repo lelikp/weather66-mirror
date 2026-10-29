@@ -105,13 +105,14 @@ def _post_upload(url, field, img, logger=None, retries=3):
     last = None
     for attempt in range(1, retries + 1):
         buf, name, mime = _as_file(img)
+        size = len(buf.getbuffer())
         try:
             r = requests.post(url, files={field: (name, buf, mime)}, timeout=90)
             try:
                 return r.json()
             except ValueError:
                 snippet = (r.text or "")[:200].replace("\n", " ")
-                last = RuntimeError(f"сервер загрузки ВК ответил не JSON: HTTP {r.status_code}, "
+                last = RuntimeError(f"сервер загрузки ВК ответил не JSON (отправлено {size // 1024} КБ): HTTP {r.status_code}, "
                                     f"{r.headers.get('Content-Type', '?')}, {len(r.content)} байт, «{snippet}»")
         except requests.RequestException as e:
             last = e
@@ -173,7 +174,7 @@ _PERMANENT = (3, 5, 7, 15, 27)
 _DOC_LIMIT = [None]      # сколько документов ВК принимает в одном посте (определяется на первой ошибке)
 
 
-def post_to_vk(images, text, logger, link=None):
+def post_to_vk(images, text, logger, link=None, require_images=False):
     """Пост на стену группы: text — простой текст, images — PIL-картинки или bytes, link — адрес поста в Telegram.
     Картинки грузятся по цепочке: фото токеном пользователя (если задан VK_USER_TOKEN) -> фото ключом сообщества ->
     документы -> без картинок (тогда в текст дописывается ссылка на оригинал). Если ВК принимает меньше документов,
@@ -214,6 +215,8 @@ def post_to_vk(images, text, logger, link=None):
             except Exception as e:                       # сбой загрузки файла (не ответ API): пост всё равно выходит
                 logger.warning(f"ВК: путь «{name}» не сработал ({e}); пробую следующий")
         if not atts:
+            if require_images:                           # пост без картинок не публикуем: пусть будет явная ошибка
+                raise RuntimeError("не удалось загрузить картинки в ВК ни одним способом")
             logger.warning("ВК: картинки перенести не удалось, в пост добавлена ссылка на оригинал")
 
     def publish(att_list):
